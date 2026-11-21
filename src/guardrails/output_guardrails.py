@@ -12,7 +12,33 @@ from google.adk.agents import llm_agent
 from google.adk import runners
 from google.adk.plugins import base_plugin
 
+from core.config import DEMO_SECRETS
 from core.utils import chat_with_agent
+
+
+REDACTED = "[REDACTED]"
+
+
+def _known_secret_pattern() -> str:
+    needles = sorted({s for s in DEMO_SECRETS if s}, key=len, reverse=True)
+    if not needles:
+        return r"(?!x)x"
+    return "|".join(re.escape(s) for s in needles)
+
+
+_PII_PATTERNS: list[tuple[str, re.Pattern]] = [
+    ("api_key", re.compile(r"\bsk-[A-Za-z0-9_-]{6,}|\bBearer\s+[A-Za-z0-9._-]{16,}", re.I)),
+    ("password", re.compile(
+        r"(?P<keep>\b(?:password|passwd|pwd|passcode|mật\s*khẩu|mat\s*khau)\s*(?:is|was|là|la|[:=])\s*)"
+        r"[\"'`]?[^\s\"'`,;]+", re.I)),
+    ("internal_host", re.compile(
+        r"\b[\w-]+(?:\.[\w-]+)*\.(?:internal|local|corp|lan)(?::\d{2,5})?\b"
+        r"|\b(?:postgres(?:ql)?|mysql|mongodb|redis)://\S+", re.I)),
+    ("known_secret", re.compile(_known_secret_pattern(), re.I)),
+    ("email", re.compile(r"\b[\w.+-]+@[\w-]+(?:\.[\w-]+)*\.[A-Za-z]{2,}\b")),
+    ("phone", re.compile(r"(?<![\d+])(?:\+84|0)(?:[\s.-]?\d){9,10}(?!\d)")),
+    ("national_id", re.compile(r"(?<!\d)(?:\d{12}|\d{9})(?!\d)")),
+]
 
 
 # ============================================================
@@ -37,23 +63,16 @@ def content_filter(response: str) -> dict:
         dict with 'safe', 'issues', and 'redacted' keys
     """
     issues = []
-    redacted = response
+    redacted = response or ""
 
-    # PII patterns to check
-    PII_PATTERNS = {
-        # TODO: Add regex patterns for:
-        # - VN phone number: r"0\d{9,10}"
-        # - Email: r"[\w.-]+@[\w.-]+\.[a-zA-Z]{2,}"
-        # - National ID (CMND/CCCD): r"\b\d{9}\b|\b\d{12}\b"
-        # - API key pattern: r"sk-[a-zA-Z0-9-]+"
-        # - Password pattern: r"password\s*[:=]\s*\S+"
-    }
-
-    for name, pattern in PII_PATTERNS.items():
-        matches = re.findall(pattern, response, re.IGNORECASE)
+    for name, pattern in _PII_PATTERNS:
+        matches = pattern.findall(redacted)
         if matches:
             issues.append(f"{name}: {len(matches)} found")
-            redacted = re.sub(pattern, "[REDACTED]", redacted, flags=re.IGNORECASE)
+            if pattern.groupindex.get("keep"):
+                redacted = pattern.sub(lambda m: m.group("keep") + REDACTED, redacted)
+            else:
+                redacted = pattern.sub(REDACTED, redacted)
 
     return {
         "safe": len(issues) == 0,
@@ -149,6 +168,7 @@ class OutputGuardrailPlugin(base_plugin.BasePlugin):
         self.blocked_count = 0
         self.redacted_count = 0
         self.total_count = 0
+        self.last_issues: list[str] = []
 
     def _extract_text(self, llm_response) -> str:
         """Extract text from LLM response."""
@@ -172,16 +192,30 @@ class OutputGuardrailPlugin(base_plugin.BasePlugin):
         if not response_text:
             return llm_response
 
-        # TODO: Implement logic:
-        # 1. Call content_filter(response_text)
-        #    - If issues found: replace llm_response.content with redacted version
-        #    - Increment self.redacted_count
-        # 2. If use_llm_judge: call llm_safety_check(response_text)
-        #    - If unsafe: replace llm_response.content with a safe message
-        #    - Increment self.blocked_count
-        # 3. Return llm_response (possibly modified)
+        self.last_issues = []
 
-        return llm_response  # TODO: modify if needed
+        result = content_filter(response_text)
+        if not result["safe"]:
+            self.redacted_count += 1
+            self.last_issues = list(result["issues"])
+            response_text = result["redacted"]
+            llm_response.content = self._make_content(response_text)
+
+        if self.use_llm_judge:
+            judge = await llm_safety_check(response_text)
+            if not judge["safe"]:
+                self.blocked_count += 1
+                self.last_issues.append(f"llm_judge: {judge['verdict'][:80]}")
+                llm_response.content = self._make_content(
+                    "Response withheld: the answer did not pass VinBank's safety check. "
+                    "Please contact hotline 1900 545 467 for support."
+                )
+
+        return llm_response
+
+    @staticmethod
+    def _make_content(text: str) -> types.Content:
+        return types.Content(role="model", parts=[types.Part.from_text(text=text)])
 
 
 # ============================================================
